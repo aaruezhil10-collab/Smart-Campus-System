@@ -2,7 +2,12 @@ const path = require('path');
 const dns = require('dns');
 require('dotenv').config({ path: path.resolve(__dirname, '.env') });
 
-dns.setServers(['8.8.8.8', '8.8.4.4']);
+// Set custom DNS resolution only if explicitly requested in local environment
+if (process.env.USE_CUSTOM_DNS === 'true') {
+  try {
+    dns.setServers(['8.8.8.8', '8.8.4.4']);
+  } catch (_) {}
+}
 
 const express = require('express');
 const mongoose = require('mongoose');
@@ -26,6 +31,15 @@ app.use(helmet({ contentSecurityPolicy: false, crossOriginResourcePolicy: false 
 app.use(express.json({ limit: '1mb' }));
 app.use(cookieParser());
 app.use('/api/auth/login', rateLimit({ windowMs: 15 * 60 * 1000, max: 30, standardHeaders: true, legacyHeaders: false }));
+
+// Middleware to ensure MongoDB Atlas connection on serverless requests
+app.use(async (_req, _res, next) => {
+  const uri = process.env.MONGODB_URI || MONGO_URI;
+  if (uri && mongoose.connection.readyState < 1) {
+    await ensureMongoConnected();
+  }
+  next();
+});
 
 const clone = (value) => JSON.parse(JSON.stringify(value));
 const id = (prefix, index) => `${prefix}-${String(index).padStart(3, '0')}`;
@@ -51,7 +65,7 @@ async function seedMemory() {
   ];
 
   memory.users = [
-    { _id: id('user', 1), name: 'Tamil Selvi', email: 'warden@smartstay.edu', password: wardenPass, role: 'warden', phone: '+91 98765 10001', active: true, createdAt: iso(now - 400 * day) },
+    { _id: id('user', 1), name: 'Dr. Meera Nair', email: 'warden@smartstay.edu', password: wardenPass, role: 'warden', phone: '+91 98765 10001', active: true, createdAt: iso(now - 400 * day) },
     { _id: id('user', 2), name: 'Arun Kumar', email: 'arun@smartstay.edu', password: studentPass, role: 'student', studentId: 'SH2026001', phone: '+91 98765 21001', course: 'B.Tech Computer Science', year: '3rd Year', guardianName: 'R. Senthil Kumar', guardianPhone: '+91 98430 12001', address: 'Erode, Tamil Nadu', roomId: id('room', 1), active: true, createdAt: iso(now - 180 * day) },
     { _id: id('user', 3), name: 'Priya Sharma', email: 'priya@smartstay.edu', password: studentPass, role: 'student', studentId: 'SH2026002', phone: '+91 98765 21002', course: 'B.Com Finance', year: '2nd Year', guardianName: 'Anil Sharma', guardianPhone: '+91 98430 12002', address: 'Kochi, Kerala', roomId: id('room', 1), active: true, createdAt: iso(now - 170 * day) },
     { _id: id('user', 4), name: 'Rahul Verma', email: 'rahul@smartstay.edu', password: studentPass, role: 'student', studentId: 'SH2026003', phone: '+91 98765 21003', course: 'B.Sc Physics', year: '1st Year', guardianName: 'Mahesh Verma', guardianPhone: '+91 98430 12003', address: 'Salem, Tamil Nadu', roomId: id('room', 2), active: true, createdAt: iso(now - 160 * day) },
@@ -524,26 +538,59 @@ async function seedMongo() {
   }
 }
 
-async function start() {
-  if (MONGO_URI) {
-    try {
-      await mongoose.connect(MONGO_URI, { serverSelectionTimeoutMS: 8000 });
-      mongoMode = true;
-      await seedMongo();
-      console.log('✓ Connected to MongoDB Atlas');
-    } catch (error) {
-      console.warn(`⚠ MongoDB connection failed (${error.message}). Using demo data store instead.`);
-      await seedMemory();
-    }
-  } else {
-    await seedMemory();
-    console.log('ℹ MONGODB_URI not configured — using auto-seeded demo data store');
+let isConnecting = null;
+
+async function ensureMongoConnected() {
+  const uri = process.env.MONGODB_URI || MONGO_URI;
+  if (!uri) return false;
+  if (mongoose.connection.readyState >= 1) {
+    mongoMode = true;
+    return true;
   }
-  app.listen(PORT, HOST, () => {
-    console.log(`✓ SmartStay is running at http://${HOST}:${PORT}`);
+
+  if (!isConnecting) {
+    isConnecting = (async () => {
+      try {
+        await mongoose.connect(uri, {
+          serverSelectionTimeoutMS: 8000,
+          connectTimeoutMS: 10000,
+        });
+        mongoMode = true;
+        await seedMongo();
+        console.log('✓ Connected to MongoDB Atlas');
+        return true;
+      } catch (error) {
+        mongoMode = false;
+        const safeMsg = (error && error.message) ? error.message.replace(/mongodb\+srv:\/\/[^@]+@/, 'mongodb+srv://***:***@') : 'Connection failed';
+        console.warn(`⚠ MongoDB connection failed (${safeMsg}). Using demo data store instead.`);
+        await seedMemory();
+        return false;
+      } finally {
+        isConnecting = null;
+      }
+    })();
+  }
+
+  return isConnecting;
+}
+
+async function start() {
+  await ensureMongoConnected();
+  if (!mongoMode) {
+    await seedMemory();
+    if (!process.env.MONGODB_URI && !MONGO_URI) {
+      console.log('ℹ MONGODB_URI not configured — using auto-seeded demo data store');
+    }
+  }
+  app.listen(PORT, () => {
+    console.log(`✓ Smart Campus System is running at http://${HOST}:${PORT}`);
     console.log('  Warden: warden@smartstay.edu / Warden@123');
     console.log('  Student: arun@smartstay.edu / Student@123');
   });
 }
 
-start();
+if (require.main === module) {
+  start();
+}
+
+module.exports = app;
